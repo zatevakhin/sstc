@@ -19,15 +19,35 @@ struct Args {
     /// Config file to use
     #[arg(short, long)]
     config: String,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(short, long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt().with_ansi(true).init();
+    let log_level = match args.log_level.to_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => {
+            eprintln!("Invalid log level: {}, defaulting to INFO", args.log_level);
+            tracing::Level::INFO
+        }
+    };
+
+    tracing_subscriber::fmt()
+        .with_ansi(true)
+        .with_max_level(log_level)
+        .init();
 
     info!("Starting video transcoder service");
+    info!("Log level is set to: {}", log_level.yellow());
 
     match which::which(FFMPEG_BIN_NAME) {
         Ok(path) => info!(
