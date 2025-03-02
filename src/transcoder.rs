@@ -147,17 +147,33 @@ impl Transcoder {
         let mut cmd = Command::new("ffmpeg");
 
         cmd.arg("-i").arg(input_path);
-        cmd.arg("-c:v").arg(&preset.video_codec);
-        cmd.arg("-c:a").arg(&preset.audio_codec);
-        cmd.arg("-b:v").arg(&preset.video_bitrate);
-        cmd.arg("-b:a").arg(&preset.audio_bitrate);
-        cmd.arg("-vf").arg(format!("scale={}", preset.scale));
+        cmd.arg("-y").arg(output_path);
+
+        if let Some(video_codec) = &preset.video_codec {
+            cmd.arg("-c:v").arg(video_codec);
+        }
+        if let Some(audio_codec) = &preset.audio_codec {
+            cmd.arg("-c:a").arg(audio_codec);
+        }
+
+        if let Some(video_bitrate) = &preset.video_bitrate {
+            cmd.arg("-b:v").arg(video_bitrate);
+        }
+        if let Some(audio_bitrate) = &preset.audio_bitrate {
+            cmd.arg("-b:a").arg(audio_bitrate);
+        }
+
+        if let Some(pixel_format) = &preset.pixel_format {
+            cmd.arg("-pix_fmt").arg(pixel_format);
+        }
+
+        if let Some(scale) = &preset.scale {
+            cmd.arg("-vf").arg(format!("scale={}", scale));
+        }
 
         for (key, value) in &preset.extra_options {
             cmd.arg(key).arg(value);
         }
-
-        cmd.arg("-y").arg(output_path);
 
         let cmd_str = format!("{:?}", cmd);
         info!("Executing: {}", cmd_str);

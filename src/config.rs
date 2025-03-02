@@ -31,17 +31,28 @@ pub struct OutputConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PresetConfig {
-    pub video_codec: String,
-    pub audio_codec: String,
-    pub video_bitrate: String,
-    pub audio_bitrate: String,
-    pub scale: String,
+    pub video_codec: Option<String>,
+    pub pixel_format: Option<String>,
+    pub audio_codec: Option<String>,
+    pub video_bitrate: Option<String>,
+    pub audio_bitrate: Option<String>,
+    pub scale: Option<String>,
     pub extra_options: HashMap<String, String>,
 }
 
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
     let file = std::fs::File::open(path).context("Failed to open config file")?;
     let config: Config = serde_yaml::from_reader(file).context("Failed to parse YAML config")?;
+
+    for input in &config.inputs {
+        if !input.path.exists() {
+            std::fs::create_dir_all(&input.path).context(format!(
+                "Failed to create input directory: {}",
+                input.path.display()
+            ))?;
+        }
+    }
+
     validate_config(&config)?;
     Ok(config)
 }
@@ -72,7 +83,7 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    for (_name, output) in &config.outputs {
+    for (_, output) in &config.outputs {
         if !output.path.exists() {
             std::fs::create_dir_all(&output.path).context(format!(
                 "Failed to create output directory: {}",
