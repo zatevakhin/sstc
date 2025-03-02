@@ -23,6 +23,10 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Override max parallel jobs
+    #[arg(short = 'j', long)]
+    max_jobs: Option<usize>,
 }
 
 #[tokio::main]
@@ -68,7 +72,10 @@ async fn main() -> Result<()> {
     };
 
     info!("Loading configuration from {}", args.config.yellow());
-    let config = config::load_config(&args.config).context("Failed to load configuration")?;
+    let mut config = config::load_config(&args.config).context("Failed to load configuration")?;
+    if let Some(max_jobs) = args.max_jobs {
+        config.max_parallel_jobs = Some(max_jobs);
+    }
 
     let config = std::sync::Arc::new(config);
 

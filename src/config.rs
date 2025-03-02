@@ -9,6 +9,7 @@ pub struct Config {
     pub inputs: Vec<InputConfig>,
     pub outputs: HashMap<String, OutputConfig>,
     pub presets: HashMap<String, PresetConfig>,
+    pub max_parallel_jobs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

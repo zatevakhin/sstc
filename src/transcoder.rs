@@ -2,21 +2,29 @@ use crate::config::{Config, InputConfig, OutputConfig, PresetConfig};
 use crate::file_check;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use owo_colors::OwoColorize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 pub struct Transcoder {
     config: Arc<Config>,
     active_jobs: DashMap<PathBuf, ()>,
+    job_semaphore: Arc<Semaphore>,
 }
 
 impl Transcoder {
     pub fn new(config: Arc<Config>) -> Self {
+        let max_jobs = config.max_parallel_jobs.unwrap_or(1);
+
+        info!("Transcoder initialized with {} max parallel jobs", max_jobs.magenta());
+
         Self {
             config,
             active_jobs: DashMap::new(),
+            job_semaphore: Arc::new(Semaphore::new(max_jobs)),
         }
     }
 
@@ -60,6 +68,9 @@ impl Transcoder {
             std::fs::create_dir_all(parent).context("Failed to create output directory")?;
         }
 
+        // Acquire a semaphore permit before starting the transcoding
+        let permit = self.job_semaphore.clone().acquire_owned().await?;
+
         match self.transcode_file(file_path, &output_path, &preset).await {
             Ok(_) => {
                 info!(
@@ -77,6 +88,7 @@ impl Transcoder {
                 }
             }
         }
+        drop(permit); // releasing a slot in the semaphore
 
         self.active_jobs.remove(file_path);
         Ok(())
