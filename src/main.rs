@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
     let transcoder = std::sync::Arc::new(Transcoder::new(config.clone()));
 
-    let watcher = DirectoryWatcher::new(config.clone(), transcoder);
+    let mut watcher = DirectoryWatcher::new(config.clone(), transcoder);
 
     watcher.start_watching().await?;
 

@@ -12,14 +12,19 @@ use tracing::{debug, error, info};
 pub struct DirectoryWatcher {
     config: Arc<Config>,
     transcoder: Arc<Transcoder>,
+    _watcher: Option<Box<dyn Watcher + Send>>,
 }
 
 impl DirectoryWatcher {
     pub fn new(config: Arc<Config>, transcoder: Arc<Transcoder>) -> Self {
-        Self { config, transcoder }
+        Self {
+            config,
+            transcoder,
+            _watcher: None,
+        }
     }
 
-    pub async fn start_watching(&self) -> Result<()> {
+    pub async fn start_watching(&mut self) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(100);
 
         let mut watcher = notify::recommended_watcher(move |res| match res {
@@ -55,7 +60,6 @@ impl DirectoryWatcher {
                         let transcoder_clone = transcoder.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_secs(1)).await;
-
                             if let Err(e) = transcoder_clone.process_file(&path_clone).await {
                                 error!("Failed to process file {}: {}", path_clone.display(), e);
                             }
@@ -64,6 +68,9 @@ impl DirectoryWatcher {
                 }
             }
         });
+
+        // Store the watcher in the struct so it doesn't get dropped
+        self._watcher = Some(Box::new(watcher));
 
         info!("Directory watcher started");
         Ok(())

@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct Transcoder {
     config: Arc<Config>,
@@ -22,6 +22,7 @@ impl Transcoder {
 
     pub async fn process_file(&self, file_path: &Path) -> Result<()> {
         let Some(input_config) = self.find_matching_input(file_path) else {
+            debug!("No matching input: {}", file_path.display());
             return Ok(());
         };
 
@@ -84,8 +85,36 @@ impl Transcoder {
     fn find_matching_input(&self, file_path: &Path) -> Option<InputConfig> {
         let extension = file_path.extension()?.to_str()?.to_lowercase();
 
+        let canonical_file_path = match std::fs::canonicalize(file_path) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to canonicalize path {}: {}", file_path.display(), e);
+                return None;
+            }
+        };
+
+        debug!("Checking file: {}", canonical_file_path.display());
+
         for input in &self.config.inputs {
-            if !file_path.starts_with(&input.path) {
+            let canonical_input_path = match std::fs::canonicalize(&input.path) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Failed to canonicalize input path {}: {}",
+                        input.path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            debug!(
+                "Comparing with input path: {}",
+                canonical_input_path.display()
+            );
+
+            if !canonical_file_path.starts_with(&canonical_input_path) {
+                debug!("Path doesn't match input directory");
                 continue;
             }
 
@@ -94,10 +123,12 @@ impl Transcoder {
                 .iter()
                 .any(|ext| ext.to_lowercase() == extension)
             {
+                debug!("Found matching input for file: {}", file_path.display());
                 return Some(input.clone());
             }
         }
 
+        debug!("No matching input found for: {}", file_path.display());
         None
     }
 
