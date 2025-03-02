@@ -38,7 +38,22 @@ enum Commands {
         #[arg(short = 'j', long)]
         max_jobs: Option<usize>,
     },
-    /// Preset generation commands
+    /// Configuration management commands
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Generate a complete example configuration file
+    Generate {
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Preset management commands
     Presets {
         #[command(subcommand)]
         action: PresetsCommand,
@@ -85,45 +100,56 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Log level is set to: {}", log_level.yellow());
+
     match &args.command {
         Commands::Run { config, max_jobs } => {
             run_transcoder(config, max_jobs).await?;
         }
-        Commands::Presets { action } => match action {
-            PresetsCommand::Generate { output } => {
-                info!("Generating example presets to {}", output.yellow());
-                PresetGenerator::save_example_presets(output)?;
-                info!("Done! You can use this file as reference or starting point.");
+        Commands::Config { action } => match action {
+            ConfigCommand::Generate { output } => {
+                info!(
+                    "Generating complete example configuration to {}",
+                    output.yellow()
+                );
+                PresetGenerator::save_example_config(output)?;
+                info!("Done! You can use this file as a starting point for your configuration.");
+                info!("Run with: sstc run -c {}", output.green());
             }
-            PresetsCommand::Add { config } => {
-                info!("Adding example presets to config file {}", config.yellow());
-                let mut config_data = config::load_config(config)?;
-                PresetGenerator::generate_example_presets(&mut config_data)?;
+            ConfigCommand::Presets { action } => match action {
+                PresetsCommand::Generate { output } => {
+                    info!("Generating example presets to {}", output.yellow());
+                    PresetGenerator::save_example_presets(output)?;
+                    info!("Done! You can use this file as reference or starting point.");
+                }
+                PresetsCommand::Add { config } => {
+                    info!("Adding example presets to config file {}", config.yellow());
+                    let mut config_data = config::load_config(config)?;
+                    PresetGenerator::generate_example_presets(&mut config_data)?;
 
-                let yaml = serde_yaml::to_string(&config_data)?;
-                std::fs::write(config, yaml)?;
-                info!("Updated config file with example presets");
-            }
-            PresetsCommand::Show => {
-                info!("Showing example presets:");
-                let mut empty_config = config::Config {
-                    inputs: Vec::new(),
-                    outputs: std::collections::HashMap::new(),
-                    presets: std::collections::HashMap::new(),
-                    max_parallel_jobs: Some(1),
-                };
+                    let yaml = serde_yaml::to_string(&config_data)?;
+                    std::fs::write(config, yaml)?;
+                    info!("Updated config file with example presets");
+                }
+                PresetsCommand::Show => {
+                    info!("Showing example presets:");
+                    let mut empty_config = config::Config {
+                        inputs: Vec::new(),
+                        outputs: std::collections::HashMap::new(),
+                        presets: std::collections::HashMap::new(),
+                        max_parallel_jobs: Some(1),
+                    };
 
-                PresetGenerator::generate_example_presets(&mut empty_config)?;
+                    PresetGenerator::generate_example_presets(&mut empty_config)?;
 
-                let presets_yaml = serde_yaml::to_string(&empty_config.presets)?;
-                println!("\n{}\n", presets_yaml);
-            }
+                    let presets_yaml = serde_yaml::to_string(&empty_config.presets)?;
+                    println!("\n{}\n", presets_yaml);
+                }
+            },
         },
     }
 
     Ok(())
 }
-
 async fn run_transcoder(config_path: &str, max_jobs: &Option<usize>) -> Result<()> {
     info!("Starting video transcoder service");
 

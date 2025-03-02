@@ -2,7 +2,7 @@ use crate::config::{Config, PresetConfig};
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 pub struct PresetGenerator;
@@ -183,6 +183,76 @@ impl PresetGenerator {
 
         info!(
             "Saved example presets to {}",
+            path.as_ref().display().green()
+        );
+        Ok(())
+    }
+
+    /// Generate and save a complete example configuration file
+    pub fn save_example_config<P: AsRef<Path>>(path: P) -> Result<()> {
+        let mut config = Config {
+            inputs: Vec::new(),
+            outputs: HashMap::new(),
+            presets: HashMap::new(),
+            max_parallel_jobs: Some(1),
+        };
+
+        // Add example inputs
+        config.inputs.push(crate::config::InputConfig {
+            path: PathBuf::from("./ingest/default"),
+            extensions: vec!["mp4".to_string(), "mkv".to_string(), "mov".to_string()],
+            preset: "medium_h264".to_string(),
+            output: "main_output".to_string(),
+        });
+
+        config.inputs.push(crate::config::InputConfig {
+            path: PathBuf::from("./ingest/gopro"),
+            extensions: vec!["mp4".to_string(), "mkv".to_string()],
+            preset: "gopro_compact".to_string(),
+            output: "gopro_output".to_string(),
+        });
+
+        config.inputs.push(crate::config::InputConfig {
+            path: PathBuf::from("./ingest/archival"),
+            extensions: vec!["mp4".to_string(), "mkv".to_string(), "mov".to_string()],
+            preset: "slow_h264".to_string(),
+            output: "archive_output".to_string(),
+        });
+
+        config.outputs.insert(
+            "main_output".to_string(),
+            crate::config::OutputConfig {
+                path: PathBuf::from("./output"),
+                filename_template: "{filename}".to_string(),
+                container: "mp4".to_string(),
+            },
+        );
+
+        config.outputs.insert(
+            "gopro_output".to_string(),
+            crate::config::OutputConfig {
+                path: PathBuf::from("./output/gopro"),
+                filename_template: "{filename}".to_string(),
+                container: "mkv".to_string(),
+            },
+        );
+
+        config.outputs.insert(
+            "archive_output".to_string(),
+            crate::config::OutputConfig {
+                path: PathBuf::from("./output/archive"),
+                filename_template: "{filename}_hq".to_string(),
+                container: "mp4".to_string(),
+            },
+        );
+
+        Self::generate_example_presets(&mut config)?;
+
+        let yaml = serde_yaml::to_string(&config)?;
+        std::fs::write(&path, yaml)?;
+
+        info!(
+            "Saved complete example configuration to {}",
             path.as_ref().display().green()
         );
         Ok(())
