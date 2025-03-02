@@ -19,7 +19,10 @@ impl Transcoder {
     pub fn new(config: Arc<Config>) -> Self {
         let max_jobs = config.max_parallel_jobs.unwrap_or(1);
 
-        info!("Transcoder initialized with {} max parallel jobs", max_jobs.magenta());
+        info!(
+            "Transcoder initialized with {} max parallel jobs",
+            max_jobs.magenta()
+        );
 
         Self {
             config,
