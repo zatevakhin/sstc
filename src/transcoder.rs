@@ -1,18 +1,67 @@
 use crate::config::{Config, InputConfig, OutputConfig, PresetConfig};
 use crate::file_check;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tqdm::tqdm;
 use tracing::{debug, error, info, warn};
 
 pub struct Transcoder {
     config: Arc<Config>,
     active_jobs: DashMap<PathBuf, ()>,
     job_semaphore: Arc<Semaphore>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FFmpegProgress {
+    frame: Option<i64>,
+    fps: Option<f64>,
+    stream_0_0_q: Option<f64>,
+    bitrate: Option<String>,
+    total_size: Option<i64>,
+    out_time_us: Option<i64>,
+    out_time_ms: Option<i64>,
+    out_time: Option<String>,
+    dup_frames: Option<i64>,
+    drop_frames: Option<i64>,
+    speed: Option<String>,
+    progress: Option<String>,
+}
+
+impl FFmpegProgress {
+    fn from_key_values(key_values: &HashMap<String, String>) -> Self {
+        let mut progress = Self::default();
+
+        for (key, value) in key_values {
+            match key.as_str() {
+                "frame" => progress.frame = value.parse().ok(),
+                "fps" => progress.fps = value.parse().ok(),
+                "stream_0_0_q" => progress.stream_0_0_q = value.parse().ok(),
+                "bitrate" => progress.bitrate = Some(value.clone()),
+                "total_size" => progress.total_size = value.parse().ok(),
+                "out_time_us" => progress.out_time_us = value.parse().ok(),
+                "out_time_ms" => progress.out_time_ms = value.parse().ok(),
+                "out_time" => progress.out_time = Some(value.clone()),
+                "dup_frames" => progress.dup_frames = value.parse().ok(),
+                "drop_frames" => progress.drop_frames = value.parse().ok(),
+                "speed" => progress.speed = Some(value.clone()),
+                "progress" => progress.progress = Some(value.clone()),
+                _ => {} // Ignore unknown fields
+            }
+        }
+
+        progress
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.progress.as_deref(), Some("end"))
+    }
 }
 
 impl Transcoder {
@@ -192,6 +241,10 @@ impl Transcoder {
     ) -> Result<()> {
         let mut cmd = Command::new("ffmpeg");
 
+        cmd.arg("-v").arg("quiet");
+        cmd.arg("-progress").arg("pipe:1");
+        cmd.arg("-stats_period").arg("1.0");
+
         cmd.arg("-i").arg(input_path);
         cmd.arg("-y").arg(output_path);
 
@@ -224,13 +277,43 @@ impl Transcoder {
         let cmd_str = format!("{:?}", cmd);
         info!("Executing: {}", cmd_str);
 
-        let output = cmd.output().context("Failed to execute ffmpeg")?;
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(anyhow!("Failed to open stdout"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("FFmpeg failed: {}", stderr));
+        let reader = BufReader::new(stdout);
+        let mut current_progress = HashMap::new();
+
+        for line in tqdm(reader.lines()) {
+            let line = line?;
+            let line = line.trim();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Some((key, value)) = line.split_once('=') {
+                current_progress.insert(key.to_string(), value.to_string());
+
+                if key == "progress" {
+                    let progress = FFmpegProgress::from_key_values(&current_progress);
+
+                    if progress.is_complete() {
+                        println!("Processing complete!");
+                        break;
+                    }
+
+                    current_progress.clear();
+                }
+            }
         }
 
-        Ok(())
+        // TODO: Add proper error.
+        return match child.stderr.context("...") {
+            Ok(_) => Ok(()),
+            Err(err) => Err(anyhow::anyhow!("FFmpeg failed: {}", err)),
+        };
     }
 }
