@@ -11,6 +11,7 @@ mod watcher;
 use watcher::DirectoryWatcher;
 mod presets;
 use presets::PresetGenerator;
+mod ffprobe;
 
 const FFMPEG_BIN_NAME: &str = "ffmpeg";
 const FFPROBE_BIN_NAME: &str = "ffprobe";

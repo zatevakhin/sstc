@@ -2,6 +2,7 @@ use crate::config::{Config, InputConfig, OutputConfig, PresetConfig};
 use crate::file_check;
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
+use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -9,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tqdm::tqdm;
 use tracing::{debug, error, info, warn};
+
+use crate::ffprobe;
 
 pub struct Transcoder {
     config: Arc<Config>,
@@ -239,6 +241,8 @@ impl Transcoder {
         output_path: &Path,
         preset: &PresetConfig,
     ) -> Result<()> {
+        let ff = ffprobe::get_format_info(input_path);
+
         let mut cmd = Command::new("ffmpeg");
 
         cmd.arg("-v").arg("quiet");
@@ -283,10 +287,25 @@ impl Transcoder {
             .take()
             .ok_or(anyhow!("Failed to open stdout"))?;
 
+        // HACK: Get stuff from stderr. I need it free for later.
+        let _ = child
+            .stderr
+            .take()
+            .ok_or(anyhow!("Failed to open stderr"))?;
+
         let reader = BufReader::new(stdout);
         let mut current_progress = HashMap::new();
 
-        for line in tqdm(reader.lines()) {
+        let bar = ProgressBar::new(ff.unwrap().duration as u64)
+            .with_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+                )
+                .unwrap(),
+            )
+            .with_message("video duration");
+
+        for line in reader.lines() {
             let line = line?;
             let line = line.trim();
 
@@ -299,9 +318,11 @@ impl Transcoder {
 
                 if key == "progress" {
                     let progress = FFmpegProgress::from_key_values(&current_progress);
+                    let progress_t = (progress.out_time_ms.unwrap_or(0) / 1_000_000) as u64;
+                    bar.set_position(progress_t);
 
                     if progress.is_complete() {
-                        println!("Processing complete!");
+                        bar.finish();
                         break;
                     }
 
