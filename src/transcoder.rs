@@ -4,12 +4,12 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::ffprobe;
@@ -18,6 +18,9 @@ pub struct Transcoder {
     config: Arc<Config>,
     active_jobs: DashMap<PathBuf, ()>,
     job_semaphore: Arc<Semaphore>,
+    file_queue: Arc<Mutex<VecDeque<PathBuf>>>,
+    queue_tx: mpsc::Sender<()>,
+    queue_rx: Arc<Mutex<mpsc::Receiver<()>>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -69,40 +72,188 @@ impl FFmpegProgress {
 impl Transcoder {
     pub fn new(config: Arc<Config>) -> Self {
         let max_jobs = config.max_parallel_jobs.unwrap_or(1);
+        let (queue_tx, queue_rx) = mpsc::channel(100);
 
         info!(
             "Transcoder initialized with {} max parallel jobs",
             max_jobs.magenta()
         );
 
-        Self {
+        let transcoder = Self {
             config,
             active_jobs: DashMap::new(),
             job_semaphore: Arc::new(Semaphore::new(max_jobs)),
+            file_queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue_tx,
+            queue_rx: Arc::new(Mutex::new(queue_rx)),
+        };
+
+        transcoder.start_queue_processor();
+
+        transcoder
+    }
+
+    fn start_queue_processor(&self) {
+        let queue_rx = self.queue_rx.clone();
+        let this = self.clone();
+
+        tokio::spawn(async move {
+            let mut rx = queue_rx.lock().await;
+
+            loop {
+                if rx.recv().await.is_none() {
+                    break;
+                }
+
+                this.process_queued_files().await;
+            }
+        });
+    }
+
+    async fn process_queued_files(&self) {
+        loop {
+            let file_path = {
+                let mut queue = self.file_queue.lock().await;
+                if queue.is_empty() {
+                    return;
+                }
+                queue.pop_front()
+            };
+
+            if let Some(file_path) = file_path {
+                if self.active_jobs.contains_key(&file_path) {
+                    info!("Already processing file: {}", file_path.display());
+                    continue;
+                }
+
+                self.spawn_file_processor(file_path).await;
+            }
+        }
+    }
+
+    async fn spawn_file_processor(&self, file_path: PathBuf) {
+        self.active_jobs.insert(file_path.clone(), ());
+
+        let this = self.clone();
+
+        tokio::spawn(async move {
+            let permit = match this.job_semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    error!("Failed to acquire semaphore: {}", e);
+                    this.active_jobs.remove(&file_path);
+                    this.requeue_file(file_path).await;
+                    return;
+                }
+            };
+
+            let output_path_result = this.get_output_path_for_file(&file_path);
+
+            match this.process_file_internal(&file_path).await {
+                Ok(_) => {
+                    info!(
+                        "Successfully processed file: {}",
+                        file_path.display().green()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Error processing file {}: {}",
+                        file_path.display().yellow(),
+                        e.red()
+                    );
+
+                    if let Ok(output_path) = output_path_result {
+                        if output_path.exists() {
+                            match std::fs::remove_file(&output_path) {
+                                Ok(_) => info!(
+                                    "Removed incomplete output file: {}",
+                                    output_path.display()
+                                ),
+                                Err(err) => error!(
+                                    "Failed to remove incomplete output file {}: {}",
+                                    output_path.display(),
+                                    err
+                                ),
+                            }
+                        }
+                    }
+
+                    if e.to_string().contains("not valid or still being copied") {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        this.requeue_file(file_path.clone()).await;
+                    }
+                }
+            }
+
+            this.active_jobs.remove(&file_path);
+
+            drop(permit);
+        });
+    }
+
+    async fn requeue_file(&self, file_path: PathBuf) {
+        let mut queue = self.file_queue.lock().await;
+        queue.push_back(file_path.clone());
+        drop(queue);
+
+        if let Err(e) = self.queue_tx.send(()).await {
+            error!("Failed to signal queue processor: {}", e);
+        } else {
+            info!(
+                "Requeued file for later processing: {}",
+                file_path.display()
+            );
         }
     }
 
     pub async fn process_file(&self, file_path: &Path) -> Result<()> {
-        let Some(input_config) = self.find_matching_input(file_path) else {
-            debug!("No matching input: {}", file_path.display());
+        let Some(_) = self.find_matching_input(file_path) else {
+            debug!(
+                "No matching input configuration found for: {}",
+                file_path.display()
+            );
             return Ok(());
         };
 
-        if self.active_jobs.contains_key(file_path) {
-            info!("Already processing file: {}", file_path.display());
-            return Ok(());
+        if !self.active_jobs.contains_key(file_path) {
+            let mut queue = self.file_queue.lock().await;
+
+            let already_queued = queue.iter().any(|p| p == file_path);
+            if !already_queued {
+                debug!("Adding file to queue: {}", file_path.display());
+                queue.push_back(file_path.to_path_buf());
+
+                drop(queue);
+                self.queue_tx
+                    .send(())
+                    .await
+                    .context("Failed to signal queue processor")?;
+                info!(
+                    "File queued for processing: {}",
+                    file_path.display().green()
+                );
+            } else {
+                debug!("File already in queue: {}", file_path.display());
+            }
+        } else {
+            info!("File already being processed: {}", file_path.display());
         }
 
-        self.active_jobs.insert(file_path.to_path_buf(), ());
+        Ok(())
+    }
 
+    async fn process_file_internal(&self, file_path: &Path) -> Result<()> {
         if !file_check::is_file_valid(file_path).await? {
-            warn!(
+            return Err(anyhow::anyhow!(
                 "File is not valid or still being copied: {}",
                 file_path.display()
-            );
-            self.active_jobs.remove(file_path);
-            return Ok(());
+            ));
         }
+
+        let Some(input_config) = self.find_matching_input(file_path) else {
+            return Err(anyhow::anyhow!("No matching input configuration found"));
+        };
 
         let preset = self.get_preset(&input_config.preset)?;
         let output = self.get_output(&input_config.output)?;
@@ -114,16 +265,12 @@ impl Transcoder {
                 "Output file already exists, skipping: {}",
                 output_path.display()
             );
-            self.active_jobs.remove(file_path);
             return Ok(());
         }
 
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).context("Failed to create output directory")?;
         }
-
-        // Acquire a semaphore permit before starting the transcoding
-        let permit = self.job_semaphore.clone().acquire_owned().await?;
 
         match self.transcode_file(file_path, &output_path, &preset).await {
             Ok(_) => {
@@ -134,17 +281,20 @@ impl Transcoder {
                 );
             }
             Err(e) => {
-                error!("Failed to transcode {}: {}", file_path.display(), e);
+                error!(
+                    "Failed to transcode {}: {}",
+                    file_path.display().yellow(),
+                    e.red()
+                );
                 if output_path.exists() {
                     if let Err(e) = std::fs::remove_file(&output_path) {
                         error!("Failed to remove incomplete output file: {}", e);
                     }
                 }
+                return Err(e);
             }
         }
-        drop(permit); // releasing a slot in the semaphore
 
-        self.active_jobs.remove(file_path);
         Ok(())
     }
 
@@ -278,8 +428,17 @@ impl Transcoder {
             cmd.arg(key).arg(value);
         }
 
-        let cmd_str = format!("{:?}", cmd);
-        info!("Executing: {}", cmd_str);
+        info!(
+            "Executing: {} {}",
+            cmd.get_program().to_str().unwrap().green(),
+            cmd.get_args()
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|i| { String::from_utf8_lossy(i.as_encoded_bytes()) })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .yellow()
+        );
 
         let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let stdout = child
@@ -287,23 +446,46 @@ impl Transcoder {
             .take()
             .ok_or(anyhow!("Failed to open stdout"))?;
 
-        // HACK: Get stuff from stderr. I need it free for later.
-        let _ = child
+        let stderr = child
             .stderr
             .take()
             .ok_or(anyhow!("Failed to open stderr"))?;
 
+        let stderr_reader = BufReader::new(stderr);
+        tokio::spawn(async move {
+            for line in stderr_reader.lines() {
+                if let Ok(line) = line {
+                    if !line.trim().is_empty() {
+                        error!("FFmpeg error: {}", line);
+                    }
+                }
+            }
+        });
+
         let reader = BufReader::new(stdout);
         let mut current_progress = HashMap::new();
 
-        let bar = ProgressBar::new(ff.unwrap().duration as u64)
-            .with_style(
-                ProgressStyle::with_template(
-                    "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+        let bar = match ff {
+            Ok(format_info) => ProgressBar::new(format_info.duration as u64)
+                .with_style(
+                    ProgressStyle::with_template(
+                        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .with_message("video duration");
+                .with_message("video duration"),
+            Err(e) => {
+                warn!("Could not get duration for {}: {}", input_path.display(), e);
+                ProgressBar::new_spinner()
+                    .with_style(
+                        ProgressStyle::with_template(
+                            "[{elapsed_precise}] {spinner} Processing... {msg}",
+                        )
+                        .unwrap(),
+                    )
+                    .with_message("transcoding")
+            }
+        };
 
         for line in reader.lines() {
             let line = line?;
@@ -318,8 +500,11 @@ impl Transcoder {
 
                 if key == "progress" {
                     let progress = FFmpegProgress::from_key_values(&current_progress);
-                    let progress_t = (progress.out_time_ms.unwrap_or(0) / 1_000_000) as u64;
-                    bar.set_position(progress_t);
+
+                    if let Some(ms) = progress.out_time_ms {
+                        let progress_t = (ms / 1_000_000) as u64;
+                        bar.set_position(progress_t);
+                    }
 
                     if progress.is_complete() {
                         bar.finish();
@@ -331,10 +516,43 @@ impl Transcoder {
             }
         }
 
-        // TODO: Add proper error.
-        return match child.stderr.context("...") {
-            Ok(_) => Ok(()),
-            Err(err) => Err(anyhow::anyhow!("FFmpeg failed: {}", err)),
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(anyhow!("FFmpeg process failed with status: {}", status));
+        }
+
+        if !output_path.exists() {
+            return Err(anyhow!(
+                "Output file was not created: {}",
+                output_path.display()
+            ));
+        }
+
+        let metadata = std::fs::metadata(output_path)?;
+        if metadata.len() == 0 {
+            return Err(anyhow!("Output file is empty: {}", output_path.display()));
+        }
+
+        Ok(())
+    }
+
+    fn get_output_path_for_file(&self, file_path: &Path) -> Result<PathBuf> {
+        let Some(input_config) = self.find_matching_input(file_path) else {
+            return Err(anyhow!("No matching input configuration found"));
         };
+
+        let output = self.get_output(&input_config.output)?;
+        self.create_output_path(file_path, &output)
+    }
+
+    pub fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            active_jobs: self.active_jobs.clone(),
+            job_semaphore: self.job_semaphore.clone(),
+            file_queue: self.file_queue.clone(),
+            queue_tx: self.queue_tx.clone(),
+            queue_rx: self.queue_rx.clone(),
+        }
     }
 }
