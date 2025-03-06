@@ -1,6 +1,7 @@
 use crate::config::{Config, InputConfig, OutputConfig, PresetConfig};
 use crate::file_check;
 use anyhow::{anyhow, Context, Result};
+use bytesize::ByteSize;
 use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -151,7 +152,7 @@ impl Transcoder {
 
             match this.process_file_internal(&file_path).await {
                 Ok(_) => {
-                    info!(
+                    debug!(
                         "Successfully processed file: {}",
                         file_path.display().green()
                     );
@@ -274,7 +275,7 @@ impl Transcoder {
 
         match self.transcode_file(file_path, &output_path, &preset).await {
             Ok(_) => {
-                info!(
+                debug!(
                     "Successfully transcoded: {} -> {}",
                     file_path.display(),
                     output_path.display()
@@ -531,6 +532,48 @@ impl Transcoder {
         let metadata = std::fs::metadata(output_path)?;
         if metadata.len() == 0 {
             return Err(anyhow!("Output file is empty: {}", output_path.display()));
+        }
+
+        let input_size = match std::fs::metadata(input_path) {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                warn!("Could not get input file size: {}", e);
+                0
+            }
+        };
+
+        if status.success() && output_path.exists() {
+            if let Ok(output_metadata) = std::fs::metadata(output_path) {
+                let output_size = output_metadata.len();
+
+                if input_size > 0 {
+                    let compression_ratio = input_size as f64 / output_size as f64;
+                    let size_reduction_percent =
+                        ((input_size - output_size) as f64 / input_size as f64) * 100.0;
+
+                    info!(
+                        "Compression stats for {}:",
+                        output_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .green()
+                    );
+                    info!(
+                        "  Input size:  {}",
+                        ByteSize::b(input_size).display().si().to_string(),
+                    );
+                    info!(
+                        "  Output size: {}",
+                        ByteSize::b(output_size).display().si().to_string(),
+                    );
+                    info!(
+                        "  Ratio: {:.2}:1 ({:.1}% smaller)",
+                        compression_ratio.abs(),
+                        size_reduction_percent
+                    );
+                }
+            }
         }
 
         Ok(())
